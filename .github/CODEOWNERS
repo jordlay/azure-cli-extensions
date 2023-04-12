@@ -284,4 +284,6 @@
 
 /src/traffic-controller/ @jaishals
 
-/src/managedccfs/ @msftsettiy
+/src/managedccfs/ @msftsettiy/src/azext_hello-world/ @jordlay
+
+/src/azext_helloworld/ @jordlay
