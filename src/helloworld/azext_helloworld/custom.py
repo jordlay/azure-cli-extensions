@@ -9,8 +9,10 @@ from knack.util import CLIError
 def print_helloworld():
     print("HELLOWORLD")
 
-def print_param(cmd, param):
+
+def print_param(param):
     print("hello2", param)
+
 
 def create_helloworld(cmd, resource_group_name, helloworld_name, location=None, tags=None):
     raise CLIError('TODO: Implement `helloworld create`')

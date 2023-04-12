@@ -16,8 +16,7 @@ class HelloworldCommandsLoader(AzCommandsLoader):
         helloworld_custom = CliCommandType(
             operations_tmpl='azext_helloworld.custom#{}',
             client_factory=cf_helloworld)
-        super(HelloworldCommandsLoader, self).__init__(cli_ctx=cli_ctx,
-                                                  custom_command_type=helloworld_custom)
+        super(HelloworldCommandsLoader, self).__init__(cli_ctx=cli_ctx, custom_command_type=helloworld_custom)
 
     def load_command_table(self, args):
         from azext_helloworld.commands import load_command_table
@@ -27,5 +26,6 @@ class HelloworldCommandsLoader(AzCommandsLoader):
     def load_arguments(self, command):
         from azext_helloworld._params import load_arguments
         load_arguments(self, command)
+
 
 COMMAND_LOADER_CLS = HelloworldCommandsLoader

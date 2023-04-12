@@ -6,20 +6,19 @@
 
 from knack.help_files import helps  # pylint: disable=unused-import
 
-
 helps['helloworld'] = """
     type: group
     short-summary: Commands to manage Helloworlds.
 """
 
-helps['helloworld create'] = """
+helps['helloworld print'] = """
     type: command
-    short-summary: Create a Helloworld.
+    short-summary: Print helloworld.
 """
 
-helps['helloworld list'] = """
+helps['helloworld print-param'] = """
     type: command
-    short-summary: List Helloworlds.
+    short-summary: Print parameter given.
 """
 
 # helps['helloworld delete'] = """

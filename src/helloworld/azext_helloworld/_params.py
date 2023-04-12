@@ -22,5 +22,5 @@ def load_arguments(self, _):
     with self.argument_context('helloworld list') as c:
         c.argument('helloworld_name', helloworld_name_type, id_part=None)
 
-    with self.argument_context('helloworld printparam') as c:
-        c.argument('param', options_list='--param', help="Specify string you want to print" )
+    with self.argument_context('helloworld print-param') as c:
+        c.argument('param', options_list='--param', help="Specify string you want to print")
