@@ -11,6 +11,7 @@ import os
 import json
 import tempfile
 import time
+from packaging import version
 import subprocess
 from subprocess import Popen, PIPE, run, STDOUT, call, DEVNULL
 from base64 import b64encode, b64decode
@@ -29,6 +30,7 @@ from knack.log import get_logger
 from knack.prompting import prompt_y_n
 from knack.prompting import NoTTYException
 from azure.cli.core.commands.client_factory import get_subscription_id
+from azure.cli.core.commands import LongRunningOperation
 from azure.cli.core._profile import Profile
 from azure.cli.core.util import sdk_no_wait
 from azure.cli.core import telemetry
@@ -99,6 +101,9 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
         account = Profile().get_subscription(subscription_id)
         onboarding_tenant_id = account['homeTenantId']
 
+    resource_id = f'/subscriptions/{subscription_id}/resourcegroups/{resource_group_name}/providers/Microsoft.Kubernetes/connectedClusters/{cluster_name}/location/{location}'
+    telemetry.add_extension_event('connectedk8s', {'Context.Default.AzureCLI.resourceid': resource_id})
+
     # Send cloud information to telemetry
     azure_cloud = send_cloud_telemetry(cmd)
 
@@ -130,14 +135,12 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
         client = cf_connected_cluster_prev_2022_10_01(cmd.cli_ctx, None)
 
     # Checking whether optional extra values file has been provided.
-    values_file_provided, values_file = utils.get_values_file()
-
-    # Validate the helm environment file for Dogfood.
-    dp_endpoint_dogfood = None
-    release_train_dogfood = None
+    values_file = utils.get_values_file()
     if cmd.cli_ctx.cloud.endpoints.resource_manager == consts.Dogfood_RMEndpoint:
         azure_cloud = consts.Azure_DogfoodCloudName
-        dp_endpoint_dogfood, release_train_dogfood = validate_env_file_dogfood(values_file, values_file_provided)
+
+    arm_metadata = utils.get_metadata(cmd.cli_ctx.cloud.endpoints.resource_manager)
+    config_dp_endpoint, release_train = get_config_dp_endpoint(cmd, location, values_file, arm_metadata)
 
     # Loading the kubeconfig file in kubernetes client configuration
     load_kube_config(kube_config, kube_context)
@@ -153,38 +156,56 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
     is_arm64_cluster = check_arm64_node(node_api_response)
 
     required_node_exists = check_linux_node(node_api_response)
-    # Pre onboarding checks
+
+    # check if this is aks_hci low bandwith scenario
+    lowbandwidth = False
+    lowbandwith_distros = ["aks_workload", "aks_management", "aks_edge_k3s", "aks_edge_k8s"]
+
+    if (infrastructure.lower() == 'azure_stack_hci') and (distribution.lower() in lowbandwith_distros):
+        lowbandwidth = True
+
+    # Install kubectl and helm
     try:
         kubectl_client_location = install_kubectl_client()
         helm_client_location = install_helm_client()
-        diagnostic_checks = "Failed"
-        batchv1_api_instance = kube_client.BatchV1Api()
-        storage_space_available = True
+    except Exception as e:
+        raise CLIInternalError("An exception has occured while trying to perform kubectl or helm install : {}".format(str(e)))
+    # Handling the user manual interrupt
+    except KeyboardInterrupt:
+        raise ManualInterrupt('Process terminated externally.')
 
-        current_time = time.ctime(time.time())
-        time_stamp = ""
-        for elements in current_time:
-            if(elements == ' '):
-                time_stamp += '-'
-                continue
-            elif(elements == ':'):
-                time_stamp += '.'
-                continue
-            time_stamp += elements
-        time_stamp = cluster_name + '-' + time_stamp
+    # Pre onboarding checks
+    diagnostic_checks = "Failed"
+    try:
+        # if aks_hci lowbandwidth scenario skip, otherwise continue to perform pre-onboarding check
+        if not lowbandwidth:
+            batchv1_api_instance = kube_client.BatchV1Api()
+            storage_space_available = True
 
-        # Generate the diagnostic folder in a given location
-        filepath_with_timestamp, diagnostic_folder_status = utils.create_folder_diagnosticlogs(time_stamp, consts.Pre_Onboarding_Check_Logs)
+            current_time = time.ctime(time.time())
+            time_stamp = ""
+            for elements in current_time:
+                if(elements == ' '):
+                    time_stamp += '-'
+                    continue
+                elif(elements == ':'):
+                    time_stamp += '.'
+                    continue
+                time_stamp += elements
+            time_stamp = cluster_name + '-' + time_stamp
 
-        if(diagnostic_folder_status is not True):
-            storage_space_available = False
+            # Generate the diagnostic folder in a given location
+            filepath_with_timestamp, diagnostic_folder_status = utils.create_folder_diagnosticlogs(time_stamp, consts.Pre_Onboarding_Check_Logs)
 
-        # Performing cluster-diagnostic-checks
-        diagnostic_checks, storage_space_available = precheckutils.fetch_diagnostic_checks_results(api_instance, batchv1_api_instance, helm_client_location, kubectl_client_location, kube_config, kube_context, location, http_proxy, https_proxy, no_proxy, proxy_cert, azure_cloud, filepath_with_timestamp, storage_space_available)
-        precheckutils.fetching_cli_output_logs(filepath_with_timestamp, storage_space_available, 1)
+            if(diagnostic_folder_status is not True):
+                storage_space_available = False
 
-        if storage_space_available is False:
-            logger.warning("There is no storage space available on your device and hence not saving cluster diagnostic check logs on your device")
+            # Performing cluster-diagnostic-checks
+            diagnostic_checks, storage_space_available = precheckutils.fetch_diagnostic_checks_results(api_instance, batchv1_api_instance, helm_client_location, kubectl_client_location, kube_config, kube_context, location, http_proxy, https_proxy, no_proxy, proxy_cert, azure_cloud, filepath_with_timestamp, storage_space_available)
+            precheckutils.fetching_cli_output_logs(filepath_with_timestamp, storage_space_available, 1)
+
+            if storage_space_available is False:
+                logger.warning("There is no storage space available on your device and hence not saving cluster diagnostic check logs on your device")
 
     except Exception as e:
         telemetry.set_exception(exception="An exception has occured while trying to execute pre-onboarding diagnostic checks : {}".format(str(e)),
@@ -200,7 +221,7 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
         raise ManualInterrupt('Process terminated externally.')
 
     # If the checks didnt pass then stop the onboarding
-    if diagnostic_checks != consts.Diagnostic_Check_Passed:
+    if diagnostic_checks != consts.Diagnostic_Check_Passed and lowbandwidth is False:
         if storage_space_available:
                 logger.warning("The pre-check result logs logs have been saved at this path:" + filepath_with_timestamp + " .\nThese logs can be attached while filing a support ticket for further assistance.\n")
         if(diagnostic_checks == consts.Diagnostic_Check_Incomplete):
@@ -209,6 +230,11 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
         else:
             telemetry.set_exception(exception='Cluster Diagnostic Prechecks Failed', fault_type=consts.Cluster_Diagnostic_Prechecks_Failed, summary="Cluster Diagnostic Prechecks Failed in the cluster")
             raise ValidationError("One or more pre-onboarding diagnostic checks failed and hence not proceeding with cluster onboarding. Please resolve them and try onboarding again.")
+
+    if lowbandwidth is False:
+        print("The required pre-checks for onboarding have succeeded.")
+    else:
+        print("Skipped onboarding pre-checks for AKS-HCI low bandwidth scenario. Continuing...")
 
     if not required_node_exists:
         telemetry.set_user_fault()
@@ -239,9 +265,6 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
         'Context.Default.AzureCLI.KubernetesInfra': kubernetes_infra
     }
     telemetry.add_extension_event('connectedk8s', kubernetes_properties)
-
-    resource_id = f'/subscriptions/{subscription_id}/resourcegroups/{resource_group_name}/providers/Microsoft.Kubernetes/connectedClusters/{cluster_name}/location/{location}'
-    telemetry.add_extension_event('connectedk8s', {'Context.Default.AzureCLI.resourceid': resource_id})
 
     # Checking if it is an AKS cluster
     is_aks_cluster = check_aks_cluster(kube_config, kube_context)
@@ -301,10 +324,11 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
                 except Exception as e:  # pylint: disable=broad-except
                     utils.arm_exception_handler(e, consts.Get_ConnectedCluster_Fault_Type, 'Failed to check if connected cluster resource already exists.')
                 cc = generate_request_payload(location, public_key, tags, kubernetes_distro, kubernetes_infra, enable_private_link, private_link_scope_resource_id, distribution_version, azure_hybrid_benefit)
-                cc_response = create_cc_resource(client, resource_group_name, cluster_name, cc, no_wait).result()
+                cc_response = create_cc_resource(client, resource_group_name, cluster_name, cc, no_wait)
+                cc_response = LongRunningOperation(cmd.cli_ctx)(cc_response)
                 # Disabling cluster-connect if private link is getting enabled
                 if enable_private_link is True:
-                    disable_cluster_connect(cmd, client, resource_group_name, cluster_name, kube_config, kube_context, values_file, values_file_provided, dp_endpoint_dogfood, release_train_dogfood, release_namespace, helm_client_location)
+                    disable_cluster_connect(cmd, client, resource_group_name, cluster_name, kube_config, kube_context, values_file, release_namespace, helm_client_location)
                 return cc_response
             else:
                 telemetry.set_exception(exception='The kubernetes cluster is already onboarded', fault_type=consts.Cluster_Already_Onboarded_Fault_Type,
@@ -327,6 +351,9 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
                                      "in the resource group {} ".format(resource_group_name) +
                                      "and corresponds to a different Kubernetes cluster.", recommendation="To onboard this Kubernetes cluster " +
                                      "to Azure, specify different resource name or resource group name.")
+        else:
+            # cleanup of stuck CRD if release namespace is not present/deleted
+            crd_cleanup_force_delete(kubectl_client_location, kube_config, kube_context)
 
     # Resource group Creation
     if resource_group_exists(cmd.cli_ctx, resource_group_name, subscription_id) is False:
@@ -342,11 +369,9 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
     if os.getenv('HELMREPONAME') and os.getenv('HELMREPOURL'):
         utils.add_helm_repo(kube_config, kube_context, helm_client_location)
 
-    # Setting the config dataplane endpoint
-    config_dp_endpoint = get_config_dp_endpoint(cmd, location)
-
     # Retrieving Helm chart OCI Artifact location
-    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, dp_endpoint_dogfood, release_train_dogfood)
+    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, release_train)
+
     # Get azure-arc agent version for telemetry
     azure_arc_agent_version = registry_path.split(':')[1]
     telemetry.add_extension_event('connectedk8s', {'Context.Default.AzureCLI.AgentVersion': azure_arc_agent_version})
@@ -377,18 +402,20 @@ def create_connectedk8s(cmd, client, resource_group_name, cluster_name, correlat
     # Generate request payload
     cc = generate_request_payload(location, public_key, tags, kubernetes_distro, kubernetes_infra, enable_private_link, private_link_scope_resource_id, distribution_version, azure_hybrid_benefit)
 
+    print("Azure resource provisioning has begun.")
     # Create connected cluster resource
-    put_cc_response = create_cc_resource(client, resource_group_name, cluster_name, cc, no_wait).result()
-
+    put_cc_response = create_cc_resource(client, resource_group_name, cluster_name, cc, no_wait)
+    put_cc_response = LongRunningOperation(cmd.cli_ctx)(put_cc_response)
+    print("Azure resource provisioning has finished.")
     # Checking if custom locations rp is registered and fetching oid if it is registered
     enable_custom_locations, custom_locations_oid = check_cl_registration_and_get_oid(cmd, cl_oid, subscription_id)
 
+    print("Starting to install Azure arc agents on the Kubernetes cluster.")
     # Install azure-arc agents
-    utils.helm_install_release(chart_path, subscription_id, kubernetes_distro, kubernetes_infra, resource_group_name, cluster_name,
+    utils.helm_install_release(cmd.cli_ctx.cloud.endpoints.resource_manager, chart_path, subscription_id, kubernetes_distro, kubernetes_infra, resource_group_name, cluster_name,
                                location, onboarding_tenant_id, http_proxy, https_proxy, no_proxy, proxy_cert, private_key_pem, kube_config,
-                               kube_context, no_wait, values_file_provided, values_file, azure_cloud, disable_auto_upgrade, enable_custom_locations,
-                               custom_locations_oid, helm_client_location, enable_private_link, onboarding_timeout, container_log_path)
-
+                               kube_context, no_wait, values_file, azure_cloud, disable_auto_upgrade, enable_custom_locations,
+                               custom_locations_oid, helm_client_location, enable_private_link, arm_metadata, onboarding_timeout, container_log_path)
     return put_cc_response
 
 
@@ -403,8 +430,8 @@ def send_cloud_telemetry(cmd):
     return cloud_name
 
 
-def validate_env_file_dogfood(values_file, values_file_provided):
-    if not values_file_provided:
+def validate_env_file_dogfood(values_file):
+    if not values_file:
         telemetry.set_exception(exception='Helm environment file not provided', fault_type=consts.Helm_Environment_File_Fault_Type,
                                 summary='Helm environment file missing')
         raise ValidationError("Helm environment file is required when using Dogfood environment for onboarding the cluster.", recommendation="Please set the environment variable 'HELMVALUESPATH' to point to the file.")
@@ -472,14 +499,17 @@ def install_helm_client():
     telemetry.add_extension_event('connectedk8s', {'Context.Default.AzureCLI.MachineType': machine_type})
 
     # Set helm binary download & install locations
+    # TODO: [Kit] Move helm binaries to internal endpoints
     if(operating_system == 'windows'):
         download_location_string = f'.azure\\helm\\{consts.HELM_VERSION}\\helm-{consts.HELM_VERSION}-{operating_system}-amd64.zip'
         install_location_string = f'.azure\\helm\\{consts.HELM_VERSION}\\{operating_system}-amd64\\helm.exe'
-        requestUri = f'{consts.HELM_STORAGE_URL}/helm/helm-{consts.HELM_VERSION}-{operating_system}-amd64.zip'
+        # requestUri = f'{consts.HELM_STORAGE_URL}/helm/helm-{consts.HELM_VERSION}-{operating_system}-amd64.zip'
+        requestUri = f'https://get.helm.sh/helm-{consts.HELM_VERSION}-{operating_system}-amd64.zip'
     elif(operating_system == 'linux' or operating_system == 'darwin'):
         download_location_string = f'.azure/helm/{consts.HELM_VERSION}/helm-{consts.HELM_VERSION}-{operating_system}-amd64.tar.gz'
         install_location_string = f'.azure/helm/{consts.HELM_VERSION}/{operating_system}-amd64/helm'
-        requestUri = f'{consts.HELM_STORAGE_URL}/helm/helm-{consts.HELM_VERSION}-{operating_system}-amd64.tar.gz'
+        # requestUri = f'{consts.HELM_STORAGE_URL}/helm/helm-{consts.HELM_VERSION}-{operating_system}-amd64.tar.gz'
+        requestUri = f'https://get.helm.sh/helm-{consts.HELM_VERSION}-{operating_system}-amd64.tar.gz'
     else:
         telemetry.set_exception(exception='Unsupported OS for installing helm client', fault_type=consts.Helm_Unsupported_OS_Fault_Type,
                                 summary=f'{operating_system} is not supported for installing helm client')
@@ -502,12 +532,20 @@ def install_helm_client():
 
         # Downloading compressed helm client executable
         logger.warning("Downloading helm client for first time. This can take few minutes...")
-        try:
-            response = urllib.request.urlopen(requestUri)
-        except Exception as e:
-            telemetry.set_exception(exception=e, fault_type=consts.Download_Helm_Fault_Type,
-                                    summary='Unable to download helm client.')
-            raise CLIInternalError("Failed to download helm client.", recommendation="Please check your internet connection." + str(e))
+        retry_count = 3
+        retry_delay = 5
+        for i in range(retry_count):
+            try:
+                response = urllib.request.urlopen(requestUri)
+                break
+            except Exception as e:
+                if i == retry_count - 1:
+                    if "Connection reset by peer" in str(e):
+                        telemetry.set_user_fault()
+                    telemetry.set_exception(exception=e, fault_type=consts.Download_Helm_Fault_Type,
+                                            summary='Unable to download helm client.')
+                    raise CLIInternalError("Failed to download helm client.", recommendation="Please check your internet connection." + str(e))
+                time.sleep(retry_delay)
 
         responseContent = response.read()
         response.close()
@@ -552,10 +590,30 @@ def connected_cluster_exists(client, resource_group_name, cluster_name):
     return True
 
 
-def get_config_dp_endpoint(cmd, location):
+def get_default_config_dp_endpoint(cmd, location):
     cloud_based_domain = cmd.cli_ctx.cloud.endpoints.active_directory.split('.')[2]
     config_dp_endpoint = "https://{}.dp.kubernetesconfiguration.azure.{}".format(location, cloud_based_domain)
     return config_dp_endpoint
+
+
+def get_config_dp_endpoint(cmd, location, values_file, arm_metadata=None):
+    release_train = None
+    config_dp_endpoint = None
+    if arm_metadata is None:
+        arm_metadata = utils.get_metadata(cmd.cli_ctx.cloud.endpoints.resource_manager)
+    # Read and validate the helm values file for Dogfood.
+    if cmd.cli_ctx.cloud.endpoints.resource_manager == consts.Dogfood_RMEndpoint:
+        config_dp_endpoint, release_train = validate_env_file_dogfood(values_file)
+    # Get the values or endpoints required for retreiving the Helm registry URL.
+    if "dataplaneEndpoints" in arm_metadata:
+        if "arcConfigEndpoint" in arm_metadata["dataplaneEndpoints"]:
+            config_dp_endpoint = arm_metadata["dataplaneEndpoints"]["arcConfigEndpoint"]
+        else:
+            logger.debug("'arcConfigEndpoint' doesn't exist under 'dataplaneEndpoints' in the ARM metadata.")
+    # Get the default config dataplane endpoint.
+    if config_dp_endpoint is None:
+        config_dp_endpoint = get_default_config_dp_endpoint(cmd, location)
+    return config_dp_endpoint, release_train
 
 
 def get_public_key(key_pair):
@@ -597,6 +655,10 @@ def get_kubernetes_distro(api_response):  # Heuristic
                 return "eks"
             if labels.get("minikube.k8s.io/version"):
                 return "minikube"
+            if annotations.get("node.aksedge.io/distro") == 'aks_edge_k3s':
+                return "aks_edge_k3s"
+            if annotations.get("node.aksedge.io/distro") == 'aks_edge_k8s':
+                return "aks_edge_k8s"
             if provider_id.startswith("kind://"):
                 return "kind"
             if provider_id.startswith("k3s://"):
@@ -966,13 +1028,7 @@ def update_connected_cluster(cmd, client, resource_group_name, cluster_name, htt
         raise MutuallyExclusiveArgumentError(consts.EnableProxy_Conflict_Error)
 
     # Checking whether optional extra values file has been provided.
-    values_file_provided, values_file = utils.get_values_file()
-
-    # Validate the helm environment file for Dogfood.
-    dp_endpoint_dogfood = None
-    release_train_dogfood = None
-    if cmd.cli_ctx.cloud.endpoints.resource_manager == consts.Dogfood_RMEndpoint:
-        dp_endpoint_dogfood, release_train_dogfood = validate_env_file_dogfood(values_file, values_file_provided)
+    values_file = utils.get_values_file()
 
     # Loading the kubeconfig file in kubernetes client configuration
     load_kube_config(kube_config, kube_context)
@@ -1008,11 +1064,10 @@ def update_connected_cluster(cmd, client, resource_group_name, cluster_name, htt
     if os.getenv('HELMREPONAME') and os.getenv('HELMREPOURL'):
         utils.add_helm_repo(kube_config, kube_context, helm_client_location)
 
-    # Setting the config dataplane endpoint
-    config_dp_endpoint = get_config_dp_endpoint(cmd, connected_cluster.location)
+    config_dp_endpoint, release_train = get_config_dp_endpoint(cmd, connected_cluster.location, values_file)
 
     # Retrieving Helm chart OCI Artifact location
-    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, dp_endpoint_dogfood, release_train_dogfood)
+    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, release_train)
 
     reg_path_array = registry_path.split(':')
     agent_version = reg_path_array[1]
@@ -1021,6 +1076,8 @@ def update_connected_cluster(cmd, client, resource_group_name, cluster_name, htt
     if connected_cluster.agent_version is not None:
         agent_version = connected_cluster.agent_version
         registry_path = reg_path_array[0] + ":" + agent_version
+
+    check_operation_support("update (properties)", agent_version)
 
     telemetry.add_extension_event('connectedk8s', {'Context.Default.AzureCLI.AgentVersion': agent_version})
 
@@ -1045,9 +1102,8 @@ def update_connected_cluster(cmd, client, resource_group_name, cluster_name, htt
             raise CLIInternalError(str.format(consts.Update_Agent_Failure, error_helm_get_values.decode("ascii")))
 
     cmd_helm_upgrade = [helm_client_location, "upgrade", "azure-arc", chart_path, "--namespace", release_namespace,
-                        "-f",
-                        user_values_location, "--wait", "--output", "json"]
-    if values_file_provided:
+                        "-f", user_values_location, "--wait", "--output", "json"]
+    if values_file:
         cmd_helm_upgrade.extend(["-f", values_file])
     if auto_upgrade is not None:
         cmd_helm_upgrade.extend(["--set", "systemDefaultValues.azureArcAgents.autoUpdate={}".format(auto_upgrade)])
@@ -1102,13 +1158,7 @@ def upgrade_agents(cmd, client, resource_group_name, cluster_name, kube_config=N
     kube_config = set_kube_config(kube_config)
 
     # Checking whether optional extra values file has been provided.
-    values_file_provided, values_file = utils.get_values_file()
-
-    # Validate the helm environment file for Dogfood.
-    dp_endpoint_dogfood = None
-    release_train_dogfood = None
-    if cmd.cli_ctx.cloud.endpoints.resource_manager == consts.Dogfood_RMEndpoint:
-        dp_endpoint_dogfood, release_train_dogfood = validate_env_file_dogfood(values_file, values_file_provided)
+    values_file = utils.get_values_file()
 
     # Loading the kubeconfig file in kubernetes client configuration
     load_kube_config(kube_config, kube_context)
@@ -1124,7 +1174,7 @@ def upgrade_agents(cmd, client, resource_group_name, cluster_name, kube_config=N
     # Install helm client
     helm_client_location = install_helm_client()
 
-    # Check Release Existance
+    # Check Release Existence
     release_namespace = utils.get_release_namespace(kube_config, kube_context, helm_client_location)
     if release_namespace:
         # Loading config map
@@ -1183,11 +1233,10 @@ def upgrade_agents(cmd, client, resource_group_name, cluster_name, kube_config=N
     if os.getenv('HELMREPONAME') and os.getenv('HELMREPOURL'):
         utils.add_helm_repo(kube_config, kube_context, helm_client_location)
 
-    # Setting the config dataplane endpoint
-    config_dp_endpoint = get_config_dp_endpoint(cmd, connected_cluster.location)
+    config_dp_endpoint, release_train = get_config_dp_endpoint(cmd, connected_cluster.location, values_file)
 
     # Retrieving Helm chart OCI Artifact location
-    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, dp_endpoint_dogfood, release_train_dogfood)
+    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, release_train)
 
     reg_path_array = registry_path.split(':')
     agent_version = reg_path_array[1]
@@ -1253,7 +1302,7 @@ def upgrade_agents(cmd, client, resource_group_name, cluster_name, kube_config=N
     if not infra_added:
         cmd_helm_upgrade.extend(["--set", "global.kubernetesInfra={}".format("generic")])
 
-    if values_file_provided:
+    if values_file:
         cmd_helm_upgrade.extend(["-f", values_file])
     if kube_config:
         cmd_helm_upgrade.extend(["--kubeconfig", kube_config])
@@ -1353,10 +1402,6 @@ def enable_features(cmd, client, resource_group_name, cluster_name, features, ku
         raise InvalidArgumentValueError("The features 'cluster-connect' and 'custom-locations' cannot be enabled for a private link enabled connected cluster.")
 
     if enable_azure_rbac:
-        if (azrbac_client_id is None) or (azrbac_client_secret is None):
-            telemetry.set_exception(exception='Application ID or secret is not provided for Azure RBAC', fault_type=consts.Application_Details_Not_Provided_For_Azure_RBAC_Fault,
-                                    summary='Application id, application secret is required to enable/update Azure RBAC feature')
-            raise RequiredArgumentMissingError("Please provide Application id, application secret to enable/update Azure RBAC feature")
         if azrbac_skip_authz_check is None:
             azrbac_skip_authz_check = ""
         azrbac_skip_authz_check = escape_proxy_settings(azrbac_skip_authz_check)
@@ -1379,13 +1424,7 @@ def enable_features(cmd, client, resource_group_name, cluster_name, features, ku
     kube_config = set_kube_config(kube_config)
 
     # Checking whether optional extra values file has been provided.
-    values_file_provided, values_file = utils.get_values_file()
-
-    # Validate the helm environment file for Dogfood.
-    dp_endpoint_dogfood = None
-    release_train_dogfood = None
-    if cmd.cli_ctx.cloud.endpoints.resource_manager == consts.Dogfood_RMEndpoint:
-        dp_endpoint_dogfood, release_train_dogfood = validate_env_file_dogfood(values_file, values_file_provided)
+    values_file = utils.get_values_file()
 
     # Loading the kubeconfig file in kubernetes client configuration
     load_kube_config(kube_config, kube_context)
@@ -1421,11 +1460,10 @@ def enable_features(cmd, client, resource_group_name, cluster_name, features, ku
     if os.getenv('HELMREPONAME') and os.getenv('HELMREPOURL'):
         utils.add_helm_repo(kube_config, kube_context, helm_client_location)
 
-    # Setting the config dataplane endpoint
-    config_dp_endpoint = get_config_dp_endpoint(cmd, connected_cluster.location)
+    config_dp_endpoint, release_train = get_config_dp_endpoint(cmd, connected_cluster.location, values_file)
 
     # Retrieving Helm chart OCI Artifact location
-    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, dp_endpoint_dogfood, release_train_dogfood)
+    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, release_train)
 
     reg_path_array = registry_path.split(':')
     agent_version = reg_path_array[1]
@@ -1435,6 +1473,8 @@ def enable_features(cmd, client, resource_group_name, cluster_name, features, ku
         agent_version = connected_cluster.agent_version
         registry_path = reg_path_array[0] + ":" + agent_version
 
+    check_operation_support("enable-features", agent_version)
+
     telemetry.add_extension_event('connectedk8s', {'Context.Default.AzureCLI.AgentVersion': agent_version})
 
     # Get Helm chart path
@@ -1443,7 +1483,7 @@ def enable_features(cmd, client, resource_group_name, cluster_name, features, ku
     cmd_helm_upgrade = [helm_client_location, "upgrade", "azure-arc", chart_path, "--namespace", release_namespace,
                         "--reuse-values",
                         "--wait", "--output", "json"]
-    if values_file_provided:
+    if values_file:
         cmd_helm_upgrade.extend(["-f", values_file])
     if kube_config:
         cmd_helm_upgrade.extend(["--kubeconfig", kube_config])
@@ -1451,8 +1491,9 @@ def enable_features(cmd, client, resource_group_name, cluster_name, features, ku
         cmd_helm_upgrade.extend(["--kube-context", kube_context])
     if enable_azure_rbac:
         cmd_helm_upgrade.extend(["--set", "systemDefaultValues.guard.enabled=true"])
-        cmd_helm_upgrade.extend(["--set", "systemDefaultValues.guard.clientId={}".format(azrbac_client_id)])
-        cmd_helm_upgrade.extend(["--set", "systemDefaultValues.guard.clientSecret={}".format(azrbac_client_secret)])
+        # Setting the default authnMode mode as "arc" for guard. This mode uses PoP token based auth. and Arc RBAC 1P apps for authN/authZ.
+        cmd_helm_upgrade.extend(["--set", "systemDefaultValues.guard.authnMode=arc"])
+        logger.warning("Please use the kubelogin version v0.0.32 or higher which has support for generating PoP token(s). This is needed by guard running in 'arc' authN mode.")
         cmd_helm_upgrade.extend(["--set", "systemDefaultValues.guard.skipAuthzCheck={}".format(azrbac_skip_authz_check)])
     if enable_cluster_connect:
         cmd_helm_upgrade.extend(["--set", "systemDefaultValues.clusterconnect-agent.enabled=true"])
@@ -1490,13 +1531,7 @@ def disable_features(cmd, client, resource_group_name, cluster_name, features, k
     kube_config = set_kube_config(kube_config)
 
     # Checking whether optional extra values file has been provided.
-    values_file_provided, values_file = utils.get_values_file()
-
-    # Validate the helm environment file for Dogfood.
-    dp_endpoint_dogfood = None
-    release_train_dogfood = None
-    if cmd.cli_ctx.cloud.endpoints.resource_manager == consts.Dogfood_RMEndpoint:
-        dp_endpoint_dogfood, release_train_dogfood = validate_env_file_dogfood(values_file, values_file_provided)
+    values_file = utils.get_values_file()
 
     # Loading the kubeconfig file in kubernetes client configuration
     load_kube_config(kube_config, kube_context)
@@ -1545,21 +1580,21 @@ def disable_features(cmd, client, resource_group_name, cluster_name, features, k
     if os.getenv('HELMREPONAME') and os.getenv('HELMREPOURL'):
         utils.add_helm_repo(kube_config, kube_context, helm_client_location)
 
-    get_chart_and_disable_features(cmd, connected_cluster, dp_endpoint_dogfood, release_train_dogfood, kube_config, kube_context,
-                                   helm_client_location, release_namespace, values_file_provided, values_file, disable_azure_rbac,
+    get_chart_and_disable_features(cmd, connected_cluster, kube_config, kube_context,
+                                   helm_client_location, release_namespace, values_file, disable_azure_rbac,
                                    disable_cluster_connect, disable_cl)
 
     return str.format(consts.Successfully_Disabled_Features, features, connected_cluster.name)
 
 
-def get_chart_and_disable_features(cmd, connected_cluster, dp_endpoint_dogfood, release_train_dogfood, kube_config, kube_context,
-                                   helm_client_location, release_namespace, values_file_provided, values_file, disable_azure_rbac=False,
+def get_chart_and_disable_features(cmd, connected_cluster, kube_config, kube_context,
+                                   helm_client_location, release_namespace, values_file, disable_azure_rbac=False,
                                    disable_cluster_connect=False, disable_cl=False):
-    # Setting the config dataplane endpoint
-    config_dp_endpoint = get_config_dp_endpoint(cmd, connected_cluster.location)
+
+    config_dp_endpoint, release_train = get_config_dp_endpoint(cmd, connected_cluster.location, values_file)
 
     # Retrieving Helm chart OCI Artifact location
-    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, dp_endpoint_dogfood, release_train_dogfood)
+    registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, release_train)
 
     reg_path_array = registry_path.split(':')
     agent_version = reg_path_array[1]
@@ -1569,6 +1604,8 @@ def get_chart_and_disable_features(cmd, connected_cluster, dp_endpoint_dogfood, 
         agent_version = connected_cluster.agent_version
         registry_path = reg_path_array[0] + ":" + agent_version
 
+    check_operation_support("disable-features", agent_version)
+
     telemetry.add_extension_event('connectedk8s', {'Context.Default.AzureCLI.AgentVersion': agent_version})
 
     # Get Helm chart path
@@ -1577,7 +1614,7 @@ def get_chart_and_disable_features(cmd, connected_cluster, dp_endpoint_dogfood, 
     cmd_helm_upgrade = [helm_client_location, "upgrade", "azure-arc", chart_path, "--namespace", release_namespace,
                         "--reuse-values",
                         "--wait", "--output", "json"]
-    if values_file_provided:
+    if values_file:
         cmd_helm_upgrade.extend(["-f", values_file])
     if kube_config:
         cmd_helm_upgrade.extend(["--kubeconfig", kube_config])
@@ -1601,12 +1638,12 @@ def get_chart_and_disable_features(cmd, connected_cluster, dp_endpoint_dogfood, 
         raise CLIInternalError(str.format(consts.Error_disabling_Features, error_helm_upgrade.decode("ascii")))
 
 
-def disable_cluster_connect(cmd, client, resource_group_name, cluster_name, kube_config, kube_context, values_file, values_file_provided, dp_endpoint_dogfood, release_train_dogfood, release_namespace, helm_client_location):
+def disable_cluster_connect(cmd, client, resource_group_name, cluster_name, kube_config, kube_context, values_file, release_namespace, helm_client_location):
     # Fetch Connected Cluster for agent version
     connected_cluster = get_connectedk8s(cmd, client, resource_group_name, cluster_name)
 
-    get_chart_and_disable_features(cmd, connected_cluster, dp_endpoint_dogfood, release_train_dogfood, kube_config, kube_context,
-                                   helm_client_location, release_namespace, values_file_provided, values_file, False,
+    get_chart_and_disable_features(cmd, connected_cluster, kube_config, kube_context,
+                                   helm_client_location, release_namespace, values_file, False,
                                    True, True)
 
 
@@ -2154,7 +2191,7 @@ def check_cl_registration_and_get_oid(cmd, cl_oid, subscription_id):
                 enable_custom_locations = False
     except Exception as e:
         enable_custom_locations = False
-        logger.warning("Unable to fetch registration state of 'Microsoft.ExtendedLocation'. Failed to enable 'custom-locations' feature...")
+        logger.warning("Unable to fetch registration state of 'Microsoft.ExtendedLocation'. Failed to enable 'custom-locations' feature. This is fine if not required. Proceeding with helm install.")
         telemetry.set_exception(exception=e, fault_type=consts.Custom_Locations_Registration_Check_Fault_Type,
                                 summary='Unable to fetch status of Custom Locations RP registration.')
     return enable_custom_locations, custom_locations_oid
@@ -2164,7 +2201,7 @@ def get_custom_locations_oid(cmd, cl_oid):
     try:
         sp_graph_client = get_graph_client_service_principals(cmd.cli_ctx)
         sub_filters = []
-        sub_filters.append("displayName eq '{}'".format("Custom Locations RP"))
+        sub_filters.append("appId eq '{}'".format("bc313c14-388c-4e7d-a58e-70017303ee3b"))  # Lookup using well-known first-party application id
         result = list(sp_graph_client.list(filter=(' and '.join(sub_filters))))
         if len(result) != 0:
             if cl_oid is not None and cl_oid != result[0].object_id:
@@ -2289,24 +2326,16 @@ def troubleshoot(cmd, client, resource_group_name, cluster_name, kube_config=Non
                     diagnostic_checks[consts.KAP_Cert_Check] = troubleshootutils.check_kap_cert(corev1_api_instance)
 
             # Checking whether optional extra values file has been provided.
-            values_file_provided, values_file = utils.get_values_file()
-
-            # Validate the helm environment file for Dogfood.
-            dp_endpoint_dogfood = None
-            release_train_dogfood = None
-            if cmd.cli_ctx.cloud.endpoints.resource_manager == consts.Dogfood_RMEndpoint:
-                consts.Azure_DogfoodCloudName
-                dp_endpoint_dogfood, release_train_dogfood = validate_env_file_dogfood(values_file, values_file_provided)
+            values_file = utils.get_values_file()
 
             # Adding helm repo
             if os.getenv('HELMREPONAME') and os.getenv('HELMREPOURL'):
                 utils.add_helm_repo(kube_config, kube_context, helm_client_location)
 
-            # Setting the config dataplane endpoint
-            config_dp_endpoint = get_config_dp_endpoint(cmd, connected_cluster.location)
+            config_dp_endpoint, release_train = get_config_dp_endpoint(cmd, connected_cluster.location, values_file)
 
             # Retrieving Helm chart OCI Artifact location
-            registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, dp_endpoint_dogfood, release_train_dogfood)
+            registry_path = os.getenv('HELMREGISTRY') if os.getenv('HELMREGISTRY') else utils.get_helm_registry(cmd, config_dp_endpoint, release_train)
 
             # Get azure-arc agent version for telemetry
             azure_arc_agent_version = registry_path.split(':')[1]
@@ -2447,3 +2476,10 @@ def crd_cleanup_force_delete(kubectl_client_location, kube_config, kube_context)
                         patch_cmd.extend(["--context", kube_context])
                     output_patch_cmd = Popen(patch_cmd, stdout=PIPE, stderr=PIPE)
                     _, error_helm_delete = output_patch_cmd.communicate()
+
+
+def check_operation_support(operation_name, agent_version):
+    error_summary = 'This CLI version does not support {} for Agents older than v1.14'.format(operation_name)
+    if (version.parse(agent_version) < version.parse("1.14.0")):
+        telemetry.set_exception(exception='Operation not supported on older Agents', fault_type=consts.Operation_Not_Supported_Fault_Type, summary=error_summary)
+        raise ClientRequestError(error_summary, recommendation="Please upgrade to the latest version of the Agents using 'az connectedk8s upgrade -g <rg_name> -n <cluster_name>'.")

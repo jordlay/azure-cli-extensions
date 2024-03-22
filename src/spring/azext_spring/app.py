@@ -80,7 +80,8 @@ def app_create(cmd, client, resource_group, service, name,
                scale_rule_http_concurrency=None,
                scale_rule_metadata=None,
                scale_rule_auth=None,
-               secrets=None):
+               secrets=None,
+               workload_profile=None):
     '''app_create
     Create app with an active deployment, deployment should be deployed with default banner
     1. Create app
@@ -126,7 +127,8 @@ def app_create(cmd, client, resource_group, service, name,
         'session_max_age': session_max_age,
         'backend_protocol': backend_protocol,
         'client_auth_certs': client_auth_certs,
-        'secrets': secrets
+        'secrets': secrets,
+        'workload_profile_name': workload_profile
     }
     create_deployment_kwargs = {
         'cpu': cpu,
@@ -153,17 +155,6 @@ def app_create(cmd, client, resource_group, service, name,
         'scale_rule_metadata': scale_rule_metadata,
         'scale_rule_auth': scale_rule_auth,
     }
-    update_app_kwargs = {
-        'enable_persistent_storage': enable_persistent_storage,
-        'public': assign_endpoint,
-        'public_for_vnet': assign_public_endpoint,
-        'ingress_read_timeout': ingress_read_timeout,
-        'ingress_send_timeout': ingress_send_timeout,
-        'session_affinity': session_affinity,
-        'session_max_age': session_max_age,
-        'backend_protocol': backend_protocol,
-        'client_auth_certs': client_auth_certs
-    }
 
     deployable = deployable_selector(**create_deployment_kwargs, **basic_kwargs)
     create_deployment_kwargs['source_type'] = deployable.get_source_type(**create_deployment_kwargs, **basic_kwargs)
@@ -173,23 +164,20 @@ def app_create(cmd, client, resource_group, service, name,
     deployment_factory.validate_instance_count(instance_count)
 
     app_resource = app_factory.format_resource(**create_app_kwargs, **basic_kwargs)
-    logger.warning('[1/3] Creating app {}'.format(name))
+    banner_deployment_name = deployment_name or DEFAULT_DEPLOYMENT_NAME
+    deployment_resource = deployment_factory.format_resource(**create_deployment_kwargs, **basic_kwargs)
+
+    logger.warning('[1/2] Creating app {}'.format(name))
     app_poller = client.apps.begin_create_or_update(resource_group, service, name, app_resource)
     wait_till_end(cmd, app_poller)
 
-    banner_deployment_name = deployment_name or DEFAULT_DEPLOYMENT_NAME
-    logger.warning('[2/3] Creating default deployment with name "{}"'.format(banner_deployment_name))
-    deployment_resource = deployment_factory.format_resource(**create_deployment_kwargs, **basic_kwargs)
+    logger.warning('[2/2] Creating default deployment with name "{}"'.format(banner_deployment_name))
     poller = client.deployments.begin_create_or_update(resource_group,
                                                        service,
                                                        name,
                                                        banner_deployment_name,
                                                        deployment_resource)
-    logger.warning('[3/3] Updating app "{}" (this operation can take a while to complete)'.format(name))
-    app_resource = app_factory.format_resource(**update_app_kwargs, **basic_kwargs)
-    app_poller = client.apps.begin_update(resource_group, service, name, app_resource)
-
-    wait_till_end(cmd, poller, app_poller)
+    wait_till_end(cmd, poller)
     logger.warning('App create succeeded')
     return app_get(cmd, client, resource_group, service, name)
 
@@ -210,6 +198,7 @@ def app_update(cmd, client, resource_group, service, name,
                session_max_age=None,
                backend_protocol=None,
                client_auth_certs=None,
+               workload_profile=None,
                # deployment.source
                runtime_version=None,
                jvm_options=None,
@@ -277,6 +266,7 @@ def app_update(cmd, client, resource_group, service, name,
         'backend_protocol': backend_protocol,
         'client_auth_certs': client_auth_certs,
         'secrets': secrets,
+        'workload_profile_name': workload_profile
     }
     if deployment is None:
         updated_deployment_kwargs = {k: v for k, v in deployment_kwargs.items() if v}
@@ -317,6 +307,7 @@ def app_deploy(cmd, client, resource_group, service, name,
                source_path=None,
                target_module=None,
                runtime_version=None,
+               server_version=None,
                jvm_options=None,
                main_entry=None,
                container_image=None,
@@ -332,6 +323,8 @@ def app_deploy(cmd, client, resource_group, service, name,
                build_memory=None,
                # deployment.settings
                env=None,
+               apms=None,
+               build_certificates=None,
                disable_probe=None,
                config_file_patterns=None,
                enable_liveness_probe=None,
@@ -367,7 +360,10 @@ def app_deploy(cmd, client, resource_group, service, name,
         'disable_probe': disable_probe,
         'config_file_patterns': config_file_patterns,
         'env': env,
+        'apms': apms,
+        'build_certificates': build_certificates,
         'runtime_version': runtime_version,
+        'server_version': server_version,
         'jvm_options': jvm_options,
         'main_entry': main_entry,
         'version': version,
@@ -529,6 +525,7 @@ def deployment_create(cmd, client, resource_group, service, app, name,
                       source_path=None,
                       target_module=None,
                       runtime_version=None,
+                      server_version=None,
                       jvm_options=None,
                       main_entry=None,
                       container_image=None,
@@ -546,6 +543,8 @@ def deployment_create(cmd, client, resource_group, service, app, name,
                       memory=None,
                       instance_count=None,
                       env=None,
+                      apms=None,
+                      build_certificates=None,
                       disable_probe=None,
                       config_file_patterns=None,
                       enable_liveness_probe=None,
@@ -587,7 +586,10 @@ def deployment_create(cmd, client, resource_group, service, app, name,
         'disable_probe': disable_probe,
         'config_file_patterns': config_file_patterns,
         'env': env,
+        'apms': apms,
+        'build_certificates': build_certificates,
         'runtime_version': runtime_version,
+        'server_version': server_version,
         'jvm_options': jvm_options,
         'main_entry': main_entry,
         'version': version,

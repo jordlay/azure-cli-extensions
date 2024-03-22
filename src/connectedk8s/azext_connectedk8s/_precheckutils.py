@@ -59,18 +59,23 @@ def fetch_diagnostic_checks_results(corev1_api_instance, batchv1_api_instance, h
             cluster_diagnostic_checks_container_log_list = cluster_diagnostic_checks_container_log.split("\n")
             cluster_diagnostic_checks_container_log_list.pop(-1)
             dns_check_log = ""
+            outbound_connectivity_check_log = ""
             counter_container_logs = 1
             # For retrieving only cluster_diagnostic_checks logs from the output
             for outputs in cluster_diagnostic_checks_container_log_list:
                 if consts.Outbound_Connectivity_Check_Result_String in outputs:
                     counter_container_logs = 1
+                    if outbound_connectivity_check_log == "":
+                        outbound_connectivity_check_log += outputs
+                    else:
+                        outbound_connectivity_check_log += "  " + outputs
                 elif consts.DNS_Check_Result_String in outputs:
                     dns_check_log += outputs
                     counter_container_logs = 0
                 elif counter_container_logs == 0:
                     dns_check_log += "  " + outputs
             dns_check, storage_space_available = azext_utils.check_cluster_DNS(dns_check_log, filepath_with_timestamp, storage_space_available, diagnoser_output)
-            outbound_connectivity_check, storage_space_available = azext_utils.check_cluster_outbound_connectivity(cluster_diagnostic_checks_container_log_list[-1], filepath_with_timestamp, storage_space_available, diagnoser_output)
+            outbound_connectivity_check, storage_space_available = azext_utils.check_cluster_outbound_connectivity(outbound_connectivity_check_log, filepath_with_timestamp, storage_space_available, diagnoser_output)
         else:
             return consts.Diagnostic_Check_Incomplete, storage_space_available
 
@@ -131,7 +136,7 @@ def executing_cluster_diagnostic_checks_job(corev1_api_instance, batchv1_api_ins
                     telemetry.set_exception(exception=error_kubectl_delete_helm.decode("ascii"), fault_type=consts.Cluster_Diagnostic_Checks_Release_Cleanup_Failed, summary="Error while executing cluster diagnostic checks Job")
                     return
 
-        chart_path = azext_utils.get_chart_path(consts.Cluster_Diagnostic_Checks_Job_Registry_Path, kube_config, kube_context, helm_client_location, consts.Pre_Onboarding_Helm_Charts_Folder_Name, consts.Pre_Onboarding_Helm_Charts_Release_Name)
+        chart_path = azext_utils.get_chart_path(consts.Cluster_Diagnostic_Checks_Job_Registry_Path, kube_config, kube_context, helm_client_location, consts.Pre_Onboarding_Helm_Charts_Folder_Name, consts.Pre_Onboarding_Helm_Charts_Release_Name, False)
 
         helm_install_release_cluster_diagnostic_checks(chart_path, location, http_proxy, https_proxy, no_proxy, proxy_cert, azure_cloud, kube_config, kube_context, helm_client_location)
 

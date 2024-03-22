@@ -13,10 +13,13 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.cli.core.azclierror import (ArgumentUsageError, ClientRequestError,
                                        InvalidArgumentValueError,
                                        MutuallyExclusiveArgumentError)
-from azure.core.exceptions import ResourceNotFoundError
+from azure.cli.core.commands.client_factory import get_subscription_id
 from knack.log import get_logger
-from .vendored_sdks.appplatform.v2023_03_01_preview.models._app_platform_management_client_enums import ApmType
+from .vendored_sdks.appplatform.v2023_11_01_preview.models import (ApmReference, CertificateReference)
+from .vendored_sdks.appplatform.v2023_11_01_preview.models._app_platform_management_client_enums import (ApmType, ConfigurationServiceGeneration)
 
+from ._gateway_constant import (GATEWAY_RESPONSE_CACHE_SCOPE_ROUTE, GATEWAY_RESPONSE_CACHE_SCOPE_INSTANCE,
+                                GATEWAY_RESPONSE_CACHE_SIZE_RESET_VALUE, GATEWAY_RESPONSE_CACHE_TTL_RESET_VALUE)
 from ._resource_quantity import validate_cpu as validate_and_normalize_cpu
 from ._resource_quantity import \
     validate_memory as validate_and_normalize_memory
@@ -123,12 +126,6 @@ def validate_build_service(namespace):
             raise InvalidArgumentValueError(
                 "Conflict detected: '--registry-server', '--registry-username' and '--registry-password' "
                 "can not be set with '--disable-build-service'.")
-        if namespace.disable_build_service:
-            namespace.disable_app_insights = True
-            if namespace.app_insights or namespace.app_insights_key:
-                raise InvalidArgumentValueError(
-                    "Conflict detected: '--app-insights' or '--app-insights-key' "
-                    "can not be set with '--disable-build-service'.")
     else:
         if namespace.disable_build_service or namespace.registry_server or namespace.registry_username or namespace.registry_password is not None:
             raise InvalidArgumentValueError("The build service is only supported with enterprise tier.")
@@ -245,10 +242,29 @@ def validate_artifact_path(namespace):
             "https://aka.ms/ascdependencies for more details")
 
 
-def validate_container_registry(cmd, namespace):
+def validate_container_registry_update(cmd, namespace):
+    validate_container_registry(namespace)
+    client = get_client(cmd)
+    try:
+        client.container_registries.get(namespace.resource_group, namespace.service, namespace.name)
+    except ResourceNotFoundError:
+        raise ClientRequestError('Container Registry {} does not exist.'.format(namespace.name))
+
+
+def validate_container_registry_create(cmd, namespace):
+    validate_container_registry(namespace)
+    client = get_client(cmd)
+    try:
+        container_registry = client.container_registries.get(namespace.resource_group, namespace.service, namespace.name)
+        if container_registry is not None:
+            raise ClientRequestError('Container Registry {} already exists.'.format(namespace.name))
+    except ResourceNotFoundError:
+        pass
+
+
+def validate_container_registry(namespace):
     if not namespace.name or not namespace.username or not namespace.password or not namespace.server:
         raise InvalidArgumentValueError('The --name, --server, --username and --password must be provided.')
-    validate_central_build_instance(cmd, namespace)
 
 
 def validate_cpu(namespace):
@@ -330,7 +346,14 @@ def _is_valid_app_and_profile_name(pattern):
     return len(parts) == 2 and _is_valid_app_name(parts[0]) and _is_valid_profile_name(parts[1])
 
 
-def validate_gateway_update(namespace):
+def validate_acs_create(namespace):
+    if namespace.application_configuration_service_generation is not None:
+        if namespace.enable_application_configuration_service is False:
+            raise ArgumentUsageError("--application-configuration-service-generation can only be set when enable application configuration service.")
+
+
+def validate_gateway_update(cmd, namespace):
+    _validate_gateway_response_cache(namespace)
     _validate_sso(namespace)
     validate_cpu(namespace)
     validate_memory(namespace)
@@ -338,6 +361,7 @@ def validate_gateway_update(namespace):
     _validate_gateway_apm_types(namespace)
     _validate_gateway_envs(namespace)
     _validate_gateway_secrets(namespace)
+    validate_apm_reference(cmd, namespace)
 
 
 def validate_api_portal_update(namespace):
@@ -386,6 +410,73 @@ def _validate_gateway_secrets(namespace):
         for item in namespace.secrets:
             secrets_dict.update(validate_tag(item))
         namespace.secrets = secrets_dict
+
+
+def _validate_gateway_response_cache(namespace):
+    _validate_gateway_response_cache_exclusive(namespace)
+    _validate_gateway_response_cache_scope(namespace)
+    _validate_gateway_response_cache_size(namespace)
+    _validate_gateway_response_cache_ttl(namespace)
+
+
+def _validate_gateway_response_cache_exclusive(namespace):
+    if namespace.enable_response_cache is not None and namespace.enable_response_cache is False \
+        and (namespace.response_cache_scope is not None
+             or namespace.response_cache_size is not None
+             or namespace.response_cache_ttl is not None):
+        raise InvalidArgumentValueError(
+            "Conflict detected: Parameters in ['--response-cache-scope', '--response-cache-scope', '--response-cache-ttl'] "
+            "cannot be set together with '--enable-response-cache false'.")
+
+
+def _validate_gateway_response_cache_scope(namespace):
+    scope = namespace.response_cache_scope
+    if (scope is not None and not isinstance(scope, str)):
+        raise InvalidArgumentValueError("The allowed values for '--response-cache-scope' are [{}, {}]".format(
+            GATEWAY_RESPONSE_CACHE_SCOPE_ROUTE, GATEWAY_RESPONSE_CACHE_SCOPE_INSTANCE
+        ))
+    if (scope is not None and isinstance(scope, str)):
+        scope = scope.lower()
+        if GATEWAY_RESPONSE_CACHE_SCOPE_ROUTE.lower() != scope \
+                and GATEWAY_RESPONSE_CACHE_SCOPE_INSTANCE.lower() != scope:
+            raise InvalidArgumentValueError("The allowed values for '--response-cache-scope' are [{}, {}]".format(
+                GATEWAY_RESPONSE_CACHE_SCOPE_ROUTE, GATEWAY_RESPONSE_CACHE_SCOPE_INSTANCE
+            ))
+        # Normalize input
+        if GATEWAY_RESPONSE_CACHE_SCOPE_ROUTE.lower() == scope:
+            namespace.response_cache_scope = GATEWAY_RESPONSE_CACHE_SCOPE_ROUTE
+        else:
+            namespace.response_cache_scope = GATEWAY_RESPONSE_CACHE_SCOPE_INSTANCE
+
+
+def _validate_gateway_response_cache_size(namespace):
+    if namespace.response_cache_size is not None:
+        size = namespace.response_cache_size
+        if type(size) != str:
+            raise InvalidArgumentValueError('--response-cache-size should be a string')
+        if GATEWAY_RESPONSE_CACHE_SIZE_RESET_VALUE.lower() == size.lower():
+            # Normalize the input
+            namespace.response_cache_size = GATEWAY_RESPONSE_CACHE_SIZE_RESET_VALUE
+        else:
+            pattern = r"^[1-9][0-9]{0,9}(GB|MB|KB)$"
+            if not match(pattern, size):
+                raise InvalidArgumentValueError(
+                    "Invalid response cache size '{}', the regex used to validate is '{}'".format(size, pattern))
+
+
+def _validate_gateway_response_cache_ttl(namespace):
+    if namespace.response_cache_ttl is not None:
+        ttl = namespace.response_cache_ttl
+        if type(ttl) != str:
+            raise InvalidArgumentValueError('--response-cache-ttl should be a string')
+        if GATEWAY_RESPONSE_CACHE_TTL_RESET_VALUE.lower() == ttl.lower():
+            # Normalize the input
+            namespace.response_cache_ttl = GATEWAY_RESPONSE_CACHE_TTL_RESET_VALUE
+        else:
+            pattern = r"^[1-9][0-9]{0,9}(h|m|s)$"
+            if not match(pattern, ttl):
+                raise InvalidArgumentValueError(
+                    "Invalid response cache ttl '{}', the regex used to validate is '{}'".format(ttl, pattern))
 
 
 def validate_routes(namespace):
@@ -459,3 +550,110 @@ def validate_customized_accelerator(namespace):
     validate_acc_git_refs(namespace)
     if namespace.accelerator_tags is not None:
         namespace.accelerator_tags = namespace.accelerator_tags.split(",") if namespace.accelerator_tags else []
+
+
+def validate_apm_properties(namespace):
+    """ Extracts multiple space-separated properties in key[=value] format """
+    if isinstance(namespace.properties, list):
+        properties_dict = {}
+        for item in namespace.properties:
+            properties_dict.update(validate_tag(item))
+        namespace.properties = properties_dict
+
+
+def validate_apm_secrets(namespace):
+    """ Extracts multiple space-separated secrets in key[=value] format """
+    if isinstance(namespace.secrets, list):
+        secrets_dict = {}
+        for item in namespace.secrets:
+            secrets_dict.update(validate_tag(item))
+        namespace.secrets = secrets_dict
+
+
+def validate_apm_not_exist(cmd, namespace):
+    client = get_client(cmd)
+    try:
+        apm_resource = client.apms.get(namespace.resource_group, namespace.service, namespace.name)
+        if apm_resource is not None:
+            raise ClientRequestError('APM {} already exists '
+                                     'in resource group {}, service {}. You can edit it by update command.'
+                                     .format(namespace.name, namespace.resource_group, namespace.service))
+    except ResourceNotFoundError:
+        # Excepted case
+        pass
+
+
+def validate_apm_update(cmd, namespace):
+    client = get_client(cmd)
+    try:
+        client.apms.get(namespace.resource_group, namespace.service, namespace.name)
+    except ResourceNotFoundError:
+        raise ClientRequestError('APM {} does not exist.'.format(namespace.name))
+
+
+def validate_apm_reference(cmd, namespace):
+    apm_names = namespace.apms
+
+    if not apm_names:
+        return
+
+    service_resource_id = get_service_resource_id(cmd, namespace)
+
+    result = []
+    for apm_name in apm_names:
+        if apm_name != "":
+            resource_id = '{}/apms/{}'.format(service_resource_id, apm_name)
+            apm_reference = ApmReference(resource_id=resource_id)
+            result.append(apm_reference)
+
+    namespace.apms = result
+
+
+def validate_apm_reference_and_enterprise_tier(cmd, namespace):
+    if namespace.apms is not None and namespace.resource_group and namespace.service and not is_enterprise_tier(
+            cmd, namespace.resource_group, namespace.service):
+        raise ArgumentUsageError("'--apms' only supports for Enterprise tier Spring instance.")
+
+    validate_apm_reference(cmd, namespace)
+
+
+def get_service_resource_id(cmd, namespace):
+    subscription = get_subscription_id(cmd.cli_ctx)
+    service_resource_id = '/subscriptions/{}/resourceGroups/{}/providers/Microsoft.AppPlatform/Spring/{}'.format(
+        subscription, namespace.resource_group, namespace.service)
+    return service_resource_id
+
+
+def validate_cert_reference(cmd, namespace):
+    cert_names = namespace.certificates
+
+    if not cert_names:
+        return
+
+    result = []
+    get_cert_resource_id(cert_names, cmd, namespace, result)
+
+    namespace.certificates = result
+
+
+def get_cert_resource_id(cert_names, cmd, namespace, result):
+    service_resource_id = get_service_resource_id(cmd, namespace)
+    for cert_name in cert_names:
+        resource_id = '{}/certificates/{}'.format(service_resource_id, cert_name)
+        cert_reference = CertificateReference(resource_id=resource_id)
+        result.append(cert_reference)
+
+
+def validate_build_cert_reference(cmd, namespace):
+    cert_names = namespace.build_certificates
+    if cert_names is not None and namespace.resource_group and namespace.service and not is_enterprise_tier(
+            cmd, namespace.resource_group, namespace.service):
+        raise ArgumentUsageError("'--build-certificates' only supports for Enterprise tier Spring instance.")
+
+    if not cert_names:
+        return
+
+    result = []
+    get_cert_resource_id(cert_names, cmd, namespace, result)
+
+    namespace.build_certificates = result
